@@ -9,6 +9,19 @@ export const MAGIC_BYTES = new TextEncoder().encode('TCAP');
 export const VERSION = 1;
 
 /**
+ * Guard against environments where WebCrypto is unavailable (e.g. a page
+ * served over plain HTTP from a non-localhost origin). Without this check
+ * `crypto.subtle` is undefined and callers see an opaque TypeError.
+ */
+function assertSubtleCryptoAvailable(): void {
+  if (typeof globalThis.crypto?.subtle === 'undefined') {
+    throw new Error(
+      'SubtleCrypto unavailable: ensure secure context (HTTPS or localhost).'
+    );
+  }
+}
+
+/**
  * Current PBKDF2 iteration count for new containers.
  * OWASP 2023 recommendation for PBKDF2-HMAC-SHA256.
  *
@@ -76,6 +89,7 @@ export async function deriveKey(
  * Structure: [MAGIC(4)] [VERSION(1)] [SALT(16)] [IV_MANIFEST(12)] [MANIFEST_LEN(4)] [ENC_MANIFEST] [IV_PAYLOAD(12)] [ENC_PAYLOAD]
  */
 export async function createContainer(files: TcapFile[], password: string): Promise<Uint8Array> {
+  assertSubtleCryptoAvailable();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key = await deriveKey(password, salt);
 
@@ -136,6 +150,7 @@ export async function createContainer(files: TcapFile[], password: string): Prom
  * Unpacks a TCAP1 container.
  */
 export async function unpackContainer(container: Uint8Array, password: string): Promise<TcapFile[]> {
+  assertSubtleCryptoAvailable();
   let offset = 0;
 
   // Verify Magic
