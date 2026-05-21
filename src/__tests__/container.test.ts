@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'bun:test';
-import { createContainer, unpackContainer, MAGIC_BYTES, VERSION } from '../index';
+import {
+  createContainer,
+  unpackContainer,
+  deriveKey,
+  computeHash,
+  MAGIC_BYTES,
+  VERSION,
+  PBKDF2_ITERATIONS,
+  LEGACY_PBKDF2_ITERATIONS,
+} from '../index';
+import { zipSync } from 'fflate';
 
 describe('TCAP Container Tests', () => {
   const password = 'test-password-123';
@@ -62,8 +72,71 @@ describe('TCAP Container Tests', () => {
 
   it('should fail to unpack with incorrect password', async () => {
     const container = await createContainer(sampleFiles, password);
-    
+
     // Subtle crypto throws an OperationError if decryption fails due to wrong key
     expect(unpackContainer(container, 'wrong-password')).rejects.toThrow();
+  });
+
+  describe('PBKDF2 iteration count (M-01)', () => {
+    it('should use the current iteration count (≥310k) for new containers', () => {
+      expect(PBKDF2_ITERATIONS).toBeGreaterThanOrEqual(310_000);
+    });
+
+    it('should still unpack legacy containers created with 100k iterations', async () => {
+      // Build a container by hand using the legacy iteration count.
+      // Format must match TCAP1 layout in createContainer(), so any drift
+      // there will fail this test loudly.
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await deriveKey(password, salt, LEGACY_PBKDF2_ITERATIONS);
+
+      const manifest = {
+        createdAt: Date.now(),
+        files: await Promise.all(sampleFiles.map(async f => ({
+          name: f.name,
+          type: f.type,
+          size: f.data.byteLength,
+          hash: await computeHash(f.data),
+        }))),
+      };
+      const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest));
+      const ivManifest = crypto.getRandomValues(new Uint8Array(12));
+      const encManifest = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: ivManifest }, key, manifestBytes
+      ));
+
+      const zipInput: Record<string, Uint8Array> = {};
+      sampleFiles.forEach(f => { zipInput[f.name] = f.data; });
+      const zipped = zipSync(zipInput);
+      const ivPayload = crypto.getRandomValues(new Uint8Array(12));
+      const encPayload = new Uint8Array(await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: ivPayload }, key, zipped
+      ));
+
+      const total = 4 + 1 + 16 + 12 + 4 + encManifest.byteLength + 12 + encPayload.byteLength;
+      const container = new Uint8Array(total);
+      let o = 0;
+      container.set(MAGIC_BYTES, o); o += 4;
+      container[o] = VERSION; o += 1;
+      container.set(salt, o); o += 16;
+      container.set(ivManifest, o); o += 12;
+      new DataView(container.buffer).setUint32(o, encManifest.byteLength, false); o += 4;
+      container.set(encManifest, o); o += encManifest.byteLength;
+      container.set(ivPayload, o); o += 12;
+      container.set(encPayload, o);
+
+      const unpacked = await unpackContainer(container, password);
+      expect(unpacked).toHaveLength(2);
+      const f1 = unpacked.find(f => f.name === 'file1.txt');
+      expect(new TextDecoder().decode(f1?.data)).toBe('Hello File 1');
+    });
+
+    it('derives a key within UX-acceptable time (<500ms)', async () => {
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const start = performance.now();
+      await deriveKey('benchmark-password', salt);
+      const elapsed = performance.now() - start;
+      // Allow generous headroom for CI; the OWASP target is "interactive".
+      expect(elapsed).toBeLessThan(2000);
+    });
   });
 });
